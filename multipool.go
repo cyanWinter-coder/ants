@@ -43,7 +43,18 @@ const (
 
 	// LeastTasks always selects the pool with the least number of pending tasks.
 	LeastTasks
+
+	// TenantFair grants a short-lived capacity lease per tenant on each submit.
+	// A tenant keeps affinity to the same pool while its lease is alive and the
+	// pool is not saturated, and no tenant can occupy the whole multi-pool:
+	// when every pool is saturated, tenants queue fairly and the first queued
+	// tenant that can use a freed slot receives the next lease.
+	TenantFair
 )
+
+// ErrTenantLeaseUnsupported will be returned when tenant-scoped submission is
+// called on a multi-pool that was not created with the TenantFair strategy.
+var ErrTenantLeaseUnsupported = errors.New("tenant leases require the TenantFair load-balancing strategy")
 
 type contextReleaser interface {
 	ReleaseContext(ctx context.Context) error
@@ -92,6 +103,11 @@ type MultiPool struct {
 	index uint32
 	state int32
 	lbs   LoadBalancingStrategy
+
+	// leases is only initialized when the multi-pool uses the TenantFair
+	// strategy; the RoundRobin and LeastTasks code paths stay lock-free.
+	leases      *leaseManager
+	nonblocking bool
 }
 
 // NewMultiPool instantiates a MultiPool with a size of the pool list and a size
@@ -101,7 +117,7 @@ func NewMultiPool(size, sizePerPool int, lbs LoadBalancingStrategy, options ...O
 		return nil, ErrInvalidMultiPoolSize
 	}
 
-	if lbs != RoundRobin && lbs != LeastTasks {
+	if lbs != RoundRobin && lbs != LeastTasks && lbs != TenantFair {
 		return nil, ErrInvalidLoadBalancingStrategy
 	}
 	pools := make([]*Pool, size)
@@ -116,7 +132,22 @@ func NewMultiPool(size, sizePerPool int, lbs LoadBalancingStrategy, options ...O
 		}
 		pools[i] = pool
 	}
-	return &MultiPool{pools: pools, index: math.MaxUint32, lbs: lbs}, nil
+	mp := &MultiPool{pools: pools, index: math.MaxUint32, lbs: lbs}
+	if lbs == TenantFair {
+		opts := loadOptions(options...)
+		mp.nonblocking = opts.Nonblocking
+		mp.leases = newLeaseManager(leasePoolSlice(pools), opts.TenantLeaseTTL)
+	}
+	return mp, nil
+}
+
+// leasePoolSlice adapts a concrete pool slice to the leasePool interface.
+func leasePoolSlice(pools []*Pool) []leasePool {
+	out := make([]leasePool, len(pools))
+	for i, p := range pools {
+		out[i] = p
+	}
+	return out
 }
 
 func (mp *MultiPool) next(lbs LoadBalancingStrategy) (idx int) {
@@ -137,9 +168,15 @@ func (mp *MultiPool) next(lbs LoadBalancingStrategy) (idx int) {
 }
 
 // Submit submits a task to a pool selected by the load-balancing strategy.
+//
+// Under the TenantFair strategy the task is attributed to the anonymous
+// tenant; use SubmitTenant to attribute it to a specific tenant.
 func (mp *MultiPool) Submit(task func()) (err error) {
 	if mp.IsClosed() {
 		return ErrPoolClosed
+	}
+	if mp.lbs == TenantFair {
+		return mp.submitLeased(anonymousTenant, task)
 	}
 	if err = mp.pools[mp.next(mp.lbs)].Submit(task); err == nil {
 		return
@@ -148,6 +185,50 @@ func (mp *MultiPool) Submit(task func()) (err error) {
 		return mp.pools[mp.next(LeastTasks)].Submit(task)
 	}
 	return
+}
+
+// SubmitTenant submits a task attributed to tenant under the capacity-lease
+// fairness rules. The lease is granted before the submission, returned once
+// when the submission fails and released when the task finishes executing.
+// It returns ErrTenantLeaseUnsupported unless the multi-pool uses TenantFair.
+func (mp *MultiPool) SubmitTenant(tenant string, task func()) error {
+	if mp.IsClosed() {
+		return ErrPoolClosed
+	}
+	if mp.lbs != TenantFair {
+		return ErrTenantLeaseUnsupported
+	}
+	return mp.submitLeased(tenant, task)
+}
+
+// submitLeased drives the acquire -> submit -> release lifecycle of one lease.
+func (mp *MultiPool) submitLeased(tenant string, task func()) error {
+	l, err := mp.leases.Acquire(tenant, mp.nonblocking)
+	if err != nil {
+		return err
+	}
+	// The lease is handed back exactly once: either immediately when the
+	// submission fails (allowing a queued tenant to take the slot), or at
+	// the end of the task after the worker has picked it up.
+	if err = mp.pools[l.poolIdx].Submit(mp.wrapLeased(l, task)); err != nil {
+		mp.leases.Release(l)
+		return err
+	}
+	mp.leases.noteDispatched()
+	return nil
+}
+
+// wrapLeased binds a lease to the task lifecycle: the lease is released when
+// the task finishes, even if it panics (the worker's own panic recovery still
+// runs afterwards).
+func (mp *MultiPool) wrapLeased(l *lease, task func()) func() {
+	return func() {
+		defer func() {
+			mp.leases.noteCompleted()
+			mp.leases.Release(l)
+		}()
+		task()
+	}
 }
 
 // Running returns the number of the currently running workers across all pools.
@@ -210,9 +291,15 @@ func (mp *MultiPool) Cap() (n int) {
 //
 // Note that this method doesn't resize the overall
 // capacity of multi-pool.
+//
+// Under the TenantFair strategy tuning advances the lease generation, so
+// leases granted before the resize cannot be applied to the resized pools.
 func (mp *MultiPool) Tune(size int) {
 	for _, pool := range mp.pools {
 		pool.Tune(size)
+	}
+	if mp.leases != nil {
+		mp.leases.advanceGeneration()
 	}
 }
 
@@ -236,6 +323,11 @@ func (mp *MultiPool) ReleaseContext(ctx context.Context) error {
 		return ErrPoolClosed
 	}
 
+	if mp.leases != nil {
+		// Invalidate in-flight leases and wake up every queued tenant.
+		mp.leases.advanceGeneration()
+	}
+
 	pools := make([]contextReleaser, len(mp.pools))
 	for i, p := range mp.pools {
 		pools[i] = p
@@ -247,8 +339,40 @@ func (mp *MultiPool) ReleaseContext(ctx context.Context) error {
 func (mp *MultiPool) Reboot() {
 	if atomic.CompareAndSwapInt32(&mp.state, CLOSED, OPENED) {
 		atomic.StoreUint32(&mp.index, 0)
+		if mp.leases != nil {
+			// Leases from the previous incarnation must not write into the
+			// rebooted pool state.
+			mp.leases.advanceGeneration()
+		}
 		for _, pool := range mp.pools {
 			pool.Reboot()
 		}
 	}
+}
+
+// LeaseStats returns the counters of the tenant-fair lease manager. It returns
+// ErrTenantLeaseUnsupported unless the multi-pool uses the TenantFair strategy.
+func (mp *MultiPool) LeaseStats() (LeaseStats, error) {
+	if mp.leases == nil {
+		return LeaseStats{}, ErrTenantLeaseUnsupported
+	}
+	return mp.leases.Stats(), nil
+}
+
+// TenantLeases returns the number of outstanding leases (in-flight leased
+// tasks) held by tenant.
+func (mp *MultiPool) TenantLeases(tenant string) (int, error) {
+	if mp.leases == nil {
+		return 0, ErrTenantLeaseUnsupported
+	}
+	return mp.leases.TenantLeases(tenant), nil
+}
+
+// TenantPool returns the index of the pool the tenant currently has affinity
+// with, or -1 when the tenant holds no lease.
+func (mp *MultiPool) TenantPool(tenant string) (int, error) {
+	if mp.leases == nil {
+		return -1, ErrTenantLeaseUnsupported
+	}
+	return mp.leases.TenantPool(tenant), nil
 }

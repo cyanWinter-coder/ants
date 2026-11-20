@@ -1382,9 +1382,9 @@ func TestReleaseContextWithNil(t *testing.T) {
 }
 
 func TestMultiPool(t *testing.T) {
-	_, err := ants.NewMultiPool(-1, 10, 8)
+	_, err := ants.NewMultiPool(-1, 10, 16)
 	require.ErrorIs(t, err, ants.ErrInvalidMultiPoolSize)
-	_, err = ants.NewMultiPool(10, -1, 8)
+	_, err = ants.NewMultiPool(10, -1, 16)
 	require.ErrorIs(t, err, ants.ErrInvalidLoadBalancingStrategy)
 	_, err = ants.NewMultiPool(10, 10, ants.RoundRobin, ants.WithExpiryDuration(-1))
 	require.ErrorIs(t, err, ants.ErrInvalidPoolExpiry)
@@ -1443,9 +1443,9 @@ func TestMultiPool(t *testing.T) {
 }
 
 func TestMultiPoolWithFunc(t *testing.T) {
-	_, err := ants.NewMultiPoolWithFunc(-1, 10, longRunningPoolFunc, 8)
+	_, err := ants.NewMultiPoolWithFunc(-1, 10, longRunningPoolFunc, 16)
 	require.ErrorIs(t, err, ants.ErrInvalidMultiPoolSize)
-	_, err = ants.NewMultiPoolWithFunc(10, -1, longRunningPoolFunc, 8)
+	_, err = ants.NewMultiPoolWithFunc(10, -1, longRunningPoolFunc, 16)
 	require.ErrorIs(t, err, ants.ErrInvalidLoadBalancingStrategy)
 	_, err = ants.NewMultiPoolWithFunc(10, 10, longRunningPoolFunc, ants.RoundRobin, ants.WithExpiryDuration(-1))
 	require.ErrorIs(t, err, ants.ErrInvalidPoolExpiry)
@@ -1505,9 +1505,9 @@ func TestMultiPoolWithFunc(t *testing.T) {
 }
 
 func TestMultiPoolWithFuncGeneric(t *testing.T) {
-	_, err := ants.NewMultiPoolWithFuncGeneric(-1, 10, longRunningPoolFuncCh, 8)
+	_, err := ants.NewMultiPoolWithFuncGeneric(-1, 10, longRunningPoolFuncCh, 16)
 	require.ErrorIs(t, err, ants.ErrInvalidMultiPoolSize)
-	_, err = ants.NewMultiPoolWithFuncGeneric(10, -1, longRunningPoolFuncCh, 8)
+	_, err = ants.NewMultiPoolWithFuncGeneric(10, -1, longRunningPoolFuncCh, 16)
 	require.ErrorIs(t, err, ants.ErrInvalidLoadBalancingStrategy)
 	_, err = ants.NewMultiPoolWithFuncGeneric(10, 10, longRunningPoolFuncCh, ants.RoundRobin, ants.WithExpiryDuration(-1))
 	require.ErrorIs(t, err, ants.ErrInvalidPoolExpiry)

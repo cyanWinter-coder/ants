@@ -122,6 +122,36 @@ pool.ReleaseTimeout(time.Second * 3)
 pool.Reboot()
 ```
 
+### 带租户公平容量租约的多池
+
+`MultiPool` 将任务分散到多个池中，以降低锁竞争。除了 `RoundRobin` 和
+`LeastTasks` 之外，`TenantFair` 策略会在每次提交时为每个租户授予一个短期
+容量**租约**：
+
+- 同一租户在租约有效期内且对应池未饱和时，始终亲和同一个池；租约过期或池
+  饱和后可以迁移；
+- 单个租户永远无法占满整个多池，至少保留一个池的容量给其他租户；长时间等待
+  的租户按 FIFO 顺序获得下一个释放出的空位；
+- 提交失败时租约立即归还一次；任务成功接入 worker 后，在任务结束时释放租约；
+- `Tune`、`ReleaseContext` 和 `Reboot` 会推进租约世代，旧租约无法写入新的池
+  状态。
+
+```go
+mp, _ := ants.NewMultiPool(4, 10, ants.TenantFair, ants.WithTenantLeaseTTL(time.Second))
+defer mp.Release()
+
+// 将任务归属到指定租户；普通 Submit 使用匿名租户。
+_ = mp.SubmitTenant("tenant-a", func() { /* ... */ })
+
+stats, _ := mp.LeaseStats()      // 可核对的获取/派发/完成计数
+n, _ := mp.TenantLeases("tenant-a")
+idx, _ := mp.TenantPool("tenant-a")
+```
+
+`MultiPoolWithFunc`（`InvokeTenant`）和 `MultiPoolWithFuncGeneric`
+（`InvokeTenant`）提供相同的租户 API。`RoundRobin` 与 `LeastTasks` 保持原有
+行为，不会分配租约管理器。
+
 ## ⚙️ 关于任务执行顺序
 
 `ants` 并不保证提交的任务被执行的顺序，执行的顺序也不是和提交的顺序保持一致，因为在 `ants` 是并发地处理所有提交的任务，提交的任务会被分派到正在并发运行的 workers 上去，因此那些任务将会被并发且无序地被执行。

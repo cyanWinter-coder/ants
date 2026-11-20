@@ -121,6 +121,38 @@ pool.ReleaseTimeout(time.Second * 3)
 pool.Reboot()
 ```
 
+### Multi-pool with tenant-fair capacity leases
+
+A `MultiPool` shards tasks over several pools to reduce lock contention. In
+addition to `RoundRobin` and `LeastTasks`, the `TenantFair` strategy grants a
+short-lived capacity **lease** per tenant on every submission:
+
+- the same tenant keeps affinity to one pool while its lease is alive and the
+  pool is not saturated; an expired lease or a saturated pool allows migration;
+- a single tenant can never occupy the whole multi-pool, at least one pool's
+  worth of capacity is always reserved for the other tenants, and long-waiting
+  tenants receive the next freed slot in FIFO order;
+- a failed submission returns its lease once; a dispatched task releases its
+  lease when it finishes;
+- `Tune`, `ReleaseContext` and `Reboot` advance the lease generation, so stale
+  leases can never write into the new pool state.
+
+```go
+mp, _ := ants.NewMultiPool(4, 10, ants.TenantFair, ants.WithTenantLeaseTTL(time.Second))
+defer mp.Release()
+
+// Attribute work to a specific tenant; plain Submit uses the anonymous tenant.
+_ = mp.SubmitTenant("tenant-a", func() { /* ... */ })
+
+stats, _ := mp.LeaseStats()      // auditable acquisition / dispatch / completion counters
+n, _ := mp.TenantLeases("tenant-a")
+idx, _ := mp.TenantPool("tenant-a")
+```
+
+The same tenant API is available on `MultiPoolWithFunc` (`InvokeTenant`) and
+`MultiPoolWithFuncGeneric` (`InvokeTenant`). `RoundRobin` and `LeastTasks` keep
+their original behavior and do not allocate a lease manager.
+
 ## ⚙️ About sequence
 
 All tasks submitted to `ants` pool will not be guaranteed to be addressed in order, because those tasks scatter among a series of concurrent workers, thus those tasks would be executed concurrently.

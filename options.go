@@ -66,6 +66,12 @@ type Options struct {
 
 	// When DisablePurge is true, workers are not purged and are resident.
 	DisablePurge bool
+
+	// TenantLeaseTTL is the lifetime of a tenant's capacity lease in a
+	// TenantFair multi-pool. Within the TTL a tenant keeps affinity to the
+	// same pool; an expired or saturated lease may migrate the tenant.
+	// A zero value falls back to the package default.
+	TenantLeaseTTL time.Duration
 }
 
 // WithOptions accepts the whole Options config.
@@ -121,5 +127,13 @@ func WithLogger(logger Logger) Option {
 func WithDisablePurge(disable bool) Option {
 	return func(opts *Options) {
 		opts.DisablePurge = disable
+	}
+}
+
+// WithTenantLeaseTTL sets the lifetime of tenant capacity leases in a
+// TenantFair multi-pool; non-positive values fall back to the default TTL.
+func WithTenantLeaseTTL(ttl time.Duration) Option {
+	return func(opts *Options) {
+		opts.TenantLeaseTTL = ttl
 	}
 }
